@@ -532,6 +532,212 @@ def rk4_step_vt(x: np.ndarray, v: np.ndarray, dt: float, Vsat_at_x: np.ndarray, 
 
 
 # =========================
+# Video object extraction and shape tracking
+# =========================
+
+def extract_object_from_video(video_path: str, max_frames: int = 200, resize_w: int = 320) -> Tuple[list, float]:
+    """
+    Extract moving object from video using background subtraction.
+    Returns list of binary masks (one per frame) and fps.
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Cannot open video: {video_path}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    
+    # Read first few frames to build background model
+    frames_bg = []
+    for _ in range(min(30, max_frames)):
+        ret, frame = cap.read()
+        if not ret:
+            break
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape
+        scale = resize_w / float(w)
+        new_h = int(round(h * scale))
+        gray = cv2.resize(gray, (resize_w, new_h), interpolation=cv2.INTER_AREA)
+        frames_bg.append(gray)
+    
+    if len(frames_bg) == 0:
+        raise ValueError("Could not read video frames.")
+    
+    # Compute median background (robust to occasional objects)
+    bg_model = np.median(frames_bg, axis=0).astype(np.uint8)
+    
+    # Reset to beginning
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    
+    masks = []
+    frame_count = 0
+    while frame_count < max_frames:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape
+        scale = resize_w / float(w)
+        new_h = int(round(h * scale))
+        gray = cv2.resize(gray, (resize_w, new_h), interpolation=cv2.INTER_AREA)
+        
+        # Background subtraction
+        diff = cv2.absdiff(gray, bg_model)
+        _, mask = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
+        
+        # Morphological operations to clean up
+        kernel = np.ones((5, 5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        
+        # Remove small noise - keep largest contour
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            largest = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(largest) > 100:  # Minimum area threshold
+                mask_clean = np.zeros_like(mask)
+                cv2.drawContours(mask_clean, [largest], -1, 255, -1)
+                masks.append(mask_clean)
+            else:
+                masks.append(np.zeros_like(mask))
+        else:
+            masks.append(np.zeros_like(mask))
+        
+        frame_count += 1
+    
+    cap.release()
+    
+    if len(masks) == 0:
+        raise ValueError("No object masks extracted from video.")
+    
+    return masks, fps
+
+def extract_object_shapes_from_masks(masks: list, n_points: int, world_box: Tuple[float, float, float, float]) -> list:
+    """
+    Extract shape points from each mask frame.
+    Returns list of (N, 2) arrays in world coordinates.
+    """
+    shapes = []
+    for mask in masks:
+        if np.sum(mask > 0) < 50:  # Too small, use previous shape or empty
+            if len(shapes) > 0:
+                shapes.append(shapes[-1].copy())
+            else:
+                shapes.append(np.zeros((n_points, 2), dtype=np.float64))
+            continue
+        
+        try:
+            # Sample points from the object mask using contour sampling
+            pts01 = sample_points_from_contours(mask, n_points=n_points)
+            # Convert to world coordinates
+            T = pts01_to_world(pts01, world_box=world_box)
+            shapes.append(T)
+        except Exception as e:
+            # Fallback to edge sampling
+            try:
+                pts01 = sample_points_from_binary_mask(mask, n_points=n_points, mode="edge")
+                T = pts01_to_world(pts01, world_box=world_box)
+                shapes.append(T)
+            except:
+                if len(shapes) > 0:
+                    shapes.append(shapes[-1].copy())
+                else:
+                    shapes.append(np.zeros((n_points, 2), dtype=np.float64))
+    
+    return shapes
+
+def assign_targets_shape_preserving(x: np.ndarray, T_prev: Optional[np.ndarray], T_curr: np.ndarray) -> np.ndarray:
+    """
+    Assign targets while preserving relative shape structure.
+    If T_prev is None, use nearest assignment.
+    Otherwise, maintain relative positions within the shape.
+    """
+    N = x.shape[0]
+    M = T_curr.shape[0]
+    assert M >= N
+    
+    if T_prev is None:
+        # First frame: use nearest assignment
+        return assign_targets_nearest(x, T_curr, preserve_order=False)
+    
+    # Strategy: For each drone, find which point in T_prev it was closest to,
+    # then find the corresponding point in T_curr that maintains the same relative position
+    
+    # Compute centroids and normalize shapes
+    centroid_prev = np.mean(T_prev, axis=0)
+    centroid_curr = np.mean(T_curr, axis=0)
+    
+    # Center shapes
+    T_prev_centered = T_prev - centroid_prev
+    T_curr_centered = T_curr - centroid_curr
+    
+    # Normalize by scale to handle size changes
+    scale_prev = np.std(T_prev_centered) + 1e-12
+    scale_curr = np.std(T_curr_centered) + 1e-12
+    T_prev_norm = T_prev_centered / scale_prev
+    T_curr_norm = T_curr_centered / scale_curr
+    
+    # For each drone, find which point in previous shape it was tracking
+    drone_to_prev_idx = np.zeros(N, dtype=int)
+    for i in range(N):
+        dists = np.linalg.norm(T_prev - x[i], axis=1)
+        drone_to_prev_idx[i] = int(np.argmin(dists))
+    
+    # Now assign: for each drone, find point in current shape with similar relative position
+    assigned = np.zeros((N, 2), dtype=np.float64)
+    used_targets = set()
+    
+    for i in range(N):
+        prev_idx = drone_to_prev_idx[i]
+        rel_pos_prev = T_prev_norm[prev_idx]
+        
+        # Find best match in current shape
+        best_score = -np.inf
+        best_j = -1
+        
+        for j in range(M):
+            if j in used_targets:
+                continue
+            
+            rel_pos_curr = T_curr_norm[j]
+            
+            # Score based on similarity of relative position
+            if np.linalg.norm(rel_pos_prev) > 1e-6 and np.linalg.norm(rel_pos_curr) > 1e-6:
+                # Direction similarity (dot product of normalized vectors)
+                dir_prev = rel_pos_prev / (np.linalg.norm(rel_pos_prev) + 1e-12)
+                dir_curr = rel_pos_curr / (np.linalg.norm(rel_pos_curr) + 1e-12)
+                dir_sim = np.dot(dir_prev, dir_curr)
+                
+                # Distance similarity
+                dist_prev = np.linalg.norm(rel_pos_prev)
+                dist_curr = np.linalg.norm(rel_pos_curr)
+                dist_sim = 1.0 / (1.0 + abs(dist_prev - dist_curr))
+                
+                score = dir_sim * 0.7 + dist_sim * 0.3
+            else:
+                score = 1.0 / (1.0 + abs(np.linalg.norm(rel_pos_prev) - np.linalg.norm(rel_pos_curr)))
+            
+            if score > best_score:
+                best_score = score
+                best_j = j
+        
+        if best_j >= 0:
+            assigned[i] = T_curr[best_j]
+            used_targets.add(best_j)
+        else:
+            # Fallback: use nearest available
+            available = [j for j in range(M) if j not in used_targets]
+            if available:
+                dists = np.linalg.norm(T_curr[available] - x[i], axis=1)
+                best_local = available[int(np.argmin(dists))]
+                assigned[i] = T_curr[best_local]
+                used_targets.add(best_local)
+            else:
+                assigned[i] = T_curr[i % M]
+    
+    return assigned
+
+# =========================
 # Optical flow -> velocity field
 # =========================
 
@@ -750,42 +956,85 @@ def main():
     traj2, x2, v2 = simulate_to_targets(x1, v1, T2, p2, dt=args.dt, steps=args.steps2)
     np.save(os.path.join(args.outdir, "traj_stage2.npy"), traj2)
 
-    # ---------- Stage 3: velocity tracking from video ----------
+    # ---------- Stage 3: Move to object and track shape from video ----------
     if not os.path.exists(args.video):
         print(f"Warning: Video file not found: {args.video}. Skipping Stage 3.")
         traj3 = traj2  # Use Stage 2 trajectory as fallback
     else:
         try:
-            flows, fps_video = compute_optical_flow_frames(args.video, max_frames=args.max_video_frames, resize_w=320)
+            print("Stage 3: Extracting object from video...")
+            masks, fps_video = extract_object_from_video(args.video, max_frames=args.max_video_frames, resize_w=320)
+            print(f"  Extracted {len(masks)} frames from video (fps: {fps_video:.2f})")
+            
+            # Extract object shapes from each frame
+            print("  Extracting object shapes...")
+            object_shapes = extract_object_shapes_from_masks(masks, n_points=args.N, world_box=world_box)
+            
+            # Find first valid shape (non-empty)
+            first_valid_idx = 0
+            for idx, shape in enumerate(object_shapes):
+                if np.any(shape != 0) and np.linalg.norm(shape) > 1e-6:
+                    first_valid_idx = idx
+                    break
+            
+            if first_valid_idx >= len(object_shapes):
+                raise ValueError("No valid object shapes found in video.")
+            
+            T_object_initial = object_shapes[first_valid_idx]
+            
+            # Phase 3a: Transition from greeting position to object initial position
+            print("  Stage 3a: Transitioning from greeting to object...")
+            T_transition = assign_targets_nearest(x2, T_object_initial, preserve_order=False)
+            p_transition = SwarmParams(kp=12.0, kd=5.0, krep=0.008, Rsafe=0.03, vmax=1.0)
+            traj_transition, x_transition, v_transition = simulate_to_targets(
+                x2, v2, T_transition, p_transition, dt=args.dt, steps=800
+            )
+            
+            # Phase 3b: Track object shape through video with shape preservation
+            print("  Stage 3b: Tracking object shape through video...")
             dt_video = 1.0 / float(fps_video if fps_video and fps_video > 1 else 25.0)
-
-            p3 = VTParams()
-
-            x = x2.copy()
-            v = v2.copy()
-
-            traj3 = [x.copy()]
-            for t in range(flows.shape[0]):
-                Vworld = flow_to_world_velocity(flows[t], world_box=world_box, dt_video=dt_video)
-
-                # Sample velocity at drone positions
-                Vx = sample_velocity_field_at_positions(Vworld, x, world_box=world_box)
-
-                # Saturate the reference velocity field (per spec)
-                Vx = saturate(Vx, p3.vmax)
-
-                # advance a few sim substeps per video frame (smoother)
-                substeps = 2
-                dt = dt_video / substeps
+            p3 = SwarmParams(kp=15.0, kd=6.0, krep=0.008, Rsafe=0.03, vmax=1.2)
+            
+            x = x_transition.copy()
+            v = v_transition.copy()
+            
+            traj3_tracking = [x.copy()]
+            T_prev = None
+            
+            # Start from first valid frame
+            for t in range(first_valid_idx, len(object_shapes)):
+                T_curr = object_shapes[t]
+                
+                # Skip if shape is invalid (empty)
+                if np.all(T_curr == 0) or np.linalg.norm(T_curr) < 1e-6:
+                    if T_prev is not None:
+                        T_curr = T_prev  # Use previous shape
+                    else:
+                        continue
+                
+                # Assign targets with shape preservation
+                T_assigned = assign_targets_shape_preserving(x, T_prev, T_curr)
+                
+                # Simulate to targets for this frame
+                # Use multiple substeps per video frame for smoother motion
+                substeps = max(1, int(round(dt_video / args.dt)))
+                dt_step = dt_video / substeps
+                
                 for _ in range(substeps):
-                    x, v = rk4_step_vt(x, v, dt, Vx, p3)
-
-                traj3.append(x.copy())
+                    x, v = rk4_step(x, v, dt_step, T_assigned, p3)
+                
+                traj3_tracking.append(x.copy())
+                T_prev = T_curr.copy()
+            
+            # Combine transition and tracking trajectories
+            traj3 = np.vstack([traj_transition, traj3_tracking])
+            
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             print(f"Error in Stage 3: {e}. Using Stage 2 trajectory as fallback.")
             traj3 = traj2
 
-    traj3 = np.stack(traj3, axis=0)
     np.save(os.path.join(args.outdir, "traj_stage3.npy"), traj3)
 
     # ---------- Visualizations ----------
