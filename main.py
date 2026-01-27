@@ -11,10 +11,6 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, FFMpegWriter
 
 
-# =========================
-# Utils: reproducibility
-# =========================
-
 def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
@@ -46,16 +42,11 @@ def normalize_pts01_tight_aspect(pts01: np.ndarray, margin: float = 0.08) -> np.
     span = np.maximum(maxs - mins, 1e-9)
     s = float(np.max(span))
     out = (pts01 - center) / s + 0.5
-    # apply margin by shrinking towards center
     m = float(np.clip(margin, 0.0, 0.49))
     if m > 0:
         out = (out - 0.5) / (1.0 - 2.0 * m) + 0.5
     return np.clip(out, 0.0, 1.0)
 
-
-# =========================
-# Target generation
-# =========================
 
 def farthest_point_sampling(points: np.ndarray, n_samples: int) -> np.ndarray:
     """
@@ -64,8 +55,7 @@ def farthest_point_sampling(points: np.ndarray, n_samples: int) -> np.ndarray:
     """
     if points.shape[0] <= n_samples:
         return points
-    
-    # Limit candidate size for speed
+
     if points.shape[0] > 20000:
         idx = np.random.choice(points.shape[0], size=20000, replace=False)
         points = points[idx]
@@ -81,20 +71,24 @@ def farthest_point_sampling(points: np.ndarray, n_samples: int) -> np.ndarray:
         selected.append(points[nxt])
     return np.array(selected, dtype=np.float64)
 
-def sample_points_from_contours(mask: np.ndarray, n_points: int) -> np.ndarray:
+def sample_points_from_contours(mask: np.ndarray, n_points: int, min_contour_area: int = 25) -> np.ndarray:
     """
     Sample points uniformly along contour arc-length. This preserves letter structure
     much better than random edge sampling for handwritten words.
+    Contours with area < min_contour_area are ignored (filters standalone points and speckles).
     """
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     if not cnts:
         raise ValueError("No contours found.")
-    
-    contours = [c.reshape(-1, 2).astype(np.float64) for c in cnts if c.shape[0] >= 5]
+
+    contours = [
+        c.reshape(-1, 2).astype(np.float64)
+        for c in cnts
+        if c.shape[0] >= 5 and cv2.contourArea(c) >= min_contour_area
+    ]
     if not contours:
-        raise ValueError("Contours too small.")
-    
-    # Calculate arc lengths
+        raise ValueError("No contours with sufficient area (increase min_contour_area or check mask).")
+
     lengths = []
     for pts in contours:
         pts_closed = np.vstack([pts, pts[0]])
@@ -103,10 +97,8 @@ def sample_points_from_contours(mask: np.ndarray, n_points: int) -> np.ndarray:
         lengths.append(max(L, 1e-9))
     lengths = np.array(lengths, dtype=np.float64)
     total = lengths.sum()
-    
-    # Allocate samples proportional to contour length
+
     alloc = np.maximum(1, np.floor(n_points * (lengths / total)).astype(int))
-    # Fix rounding
     while alloc.sum() < n_points:
         alloc[np.argmax(lengths)] += 1
     while alloc.sum() > n_points:
@@ -132,8 +124,7 @@ def sample_points_from_contours(mask: np.ndarray, n_points: int) -> np.ndarray:
         p = pts_closed[idx] * (1 - t[:, None]) + pts_closed[idx + 1] * t[:, None]
         sampled.append(p)
     pts = np.vstack(sampled)
-    
-    # Trim/pad if needed
+
     if pts.shape[0] > n_points:
         pts = pts[np.random.choice(pts.shape[0], size=n_points, replace=False)]
     elif pts.shape[0] < n_points:
@@ -163,19 +154,16 @@ def sample_points_from_binary_mask(mask: np.ndarray, n_points: int, mode: str = 
         ys, xs = np.where(mask > 0)
 
     if len(xs) < max(50, n_points // 4):
-        # fallback: use filled if edges are too sparse
         ys, xs = np.where(mask > 0)
 
     if len(xs) == 0:
         raise ValueError("No foreground points found in mask. Check your image thresholding.")
 
     pts_all = np.stack([xs, ys], axis=1).astype(np.float64)
-    
-    # Use farthest-point sampling for better distribution
+
     k = min(n_points, pts_all.shape[0])
     pts = farthest_point_sampling(pts_all, k)
-    
-    # Pad if needed
+
     if pts.shape[0] < n_points:
         needed = n_points - pts.shape[0]
         extra_idx = np.random.choice(pts.shape[0], size=needed, replace=True)
@@ -183,7 +171,6 @@ def sample_points_from_binary_mask(mask: np.ndarray, n_points: int, mode: str = 
         extra += np.random.normal(scale=0.8, size=extra.shape)
         pts = np.vstack([pts, extra])
 
-    # normalize to [0,1]
     h, w = mask.shape
     pts[:, 0] /= (w - 1)
     pts[:, 1] /= (h - 1)
@@ -199,10 +186,8 @@ def load_handwritten_word_points(image_path: str, n_points: int) -> np.ndarray:
     if img is None:
         raise FileNotFoundError(f"Cannot read image: {image_path}")
 
-    # Denoise
     img = cv2.GaussianBlur(img, (5, 5), 0)
 
-    # Try adaptive threshold first, fallback to Otsu if needed
     try:
         mask = cv2.adaptiveThreshold(
             img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 10
@@ -210,38 +195,33 @@ def load_handwritten_word_points(image_path: str, n_points: int) -> np.ndarray:
     except:
         _, mask = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-    # Clean noise and ensure connectivity
     kernel = np.ones((3, 3), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-    
-    # Moderate dilation to ensure thin strokes (like 'e') are thick enough for sampling
-    # This helps capture letters with thinner strokes better, especially internal counters
     mask = cv2.dilate(mask, kernel, iterations=2)
-    
-    # Additional light dilation specifically for thin internal structures (like 'e' counters)
-    # This helps ensure small enclosed areas get sampled
     mask = cv2.dilate(mask, kernel, iterations=1)
 
-    # Hybrid sampling: prioritize contour to capture thin strokes and edges
-    # Higher contour percentage helps capture 'e' shapes better
-    n_contour = int(n_points * 0.70)  # Even more contour to better capture thin strokes like 'e'
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8), connectivity=8)
+    if num_labels > 1:
+        areas = stats[1:, cv2.CC_STAT_AREA]
+        max_area = float(np.max(areas))
+        keep_labels = [i + 1 for i, a in enumerate(areas) if a >= max_area * 0.03]
+        mask_out = np.zeros_like(mask)
+        for lb in keep_labels:
+            mask_out[labels == lb] = 255
+        mask = mask_out
+
+    n_contour = int(n_points * 0.70)
     n_fill = n_points - n_contour
-    
+
     try:
         pts_contour = sample_points_from_contours(mask, n_points=n_contour)
     except Exception:
         pts_contour = sample_points_from_binary_mask(mask, n_points=n_contour, mode="edge")
-    
+
     pts_fill = sample_points_from_binary_mask(mask, n_points=n_fill, mode="fill")
-    
-    # Combine points - preserve natural spacing from image
     pts01 = np.vstack([pts_contour, pts_fill])
-    
-    # Don't redistribute - preserve the natural spacing from the image
-    # The image already has good spacing, so we want to keep that structure
-    
-    # Normalize with moderate margin to preserve spacing
-    return normalize_pts01_tight(pts01, margin=0.10)
+    pts01_norm = normalize_pts01_tight(pts01, margin=0.10)
+    return pts01_norm
 
 def render_text_to_points(text: str, n_points: int, img_size=(1400, 400)) -> np.ndarray:
     """
@@ -252,7 +232,6 @@ def render_text_to_points(text: str, n_points: int, img_size=(1400, 400)) -> np.
     img = Image.new("L", (W, H), color=255)
     draw = ImageDraw.Draw(img)
 
-    # Try a bold font for thicker strokes
     base_font = None
     for candidate in [
         "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
@@ -263,8 +242,7 @@ def render_text_to_points(text: str, n_points: int, img_size=(1400, 400)) -> np.
         if os.path.exists(candidate):
             base_font = candidate
             break
-    
-    # Dynamic font sizing to fit text
+
     font_size = 180
     font = None
     if base_font:
@@ -281,25 +259,19 @@ def render_text_to_points(text: str, n_points: int, img_size=(1400, 400)) -> np.
     if font is None:
         font = ImageFont.load_default()
 
-    # center text with generous horizontal padding to prevent edge compression
     bbox = draw.textbbox((0, 0), text, font=font)
     tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    # Add horizontal padding (15% on each side) so H and R/! aren't at absolute edges
     x_pad = int(W * 0.15)
     x = x_pad + (W - 2*x_pad - tw) // 2
     y = (H - th) // 2
     draw.text((x, y), text, fill=0, font=font)
 
     arr = np.array(img)
-    # binary mask: letters -> foreground
     mask = (arr < 200).astype(np.uint8) * 255
-    
-    # Slight dilation to thicken strokes
+
     kernel = np.ones((3, 3), np.uint8)
     mask = cv2.dilate(mask, kernel, iterations=1)
     
-    # Hybrid sampling: 50% contour (sharp edges), 50% fill (body)
-    # More fill helps with letter body definition, especially for H, R, !
     n_contour = int(n_points * 0.5)
     n_fill = n_points - n_contour
     
@@ -310,17 +282,12 @@ def render_text_to_points(text: str, n_points: int, img_size=(1400, 400)) -> np.
     
     pts_fill = sample_points_from_binary_mask(mask, n_points=n_fill, mode="fill")
     
-    # Combine and shuffle
     pts01 = np.vstack([pts_contour, pts_fill])
     np.random.shuffle(pts01)
     
-    # Normalize preserving aspect ratio with larger margin to prevent edge compression
     return normalize_pts01_tight_aspect(pts01, margin=0.12)
 
 
-# =========================
-# Geometry scaling / mapping
-# =========================
 
 def pts01_to_world(pts01: np.ndarray, world_box: Tuple[float, float, float, float]) -> np.ndarray:
     """
@@ -329,7 +296,7 @@ def pts01_to_world(pts01: np.ndarray, world_box: Tuple[float, float, float, floa
     """
     xmin, xmax, ymin, ymax = world_box
     x = xmin + pts01[:, 0] * (xmax - xmin)
-    y = ymax - pts01[:, 1] * (ymax - ymin)  # invert y so image top maps to ymax
+    y = ymax - pts01[:, 1] * (ymax - ymin)
     return np.stack([x, y], axis=1)
 
 def init_positions_grid(N: int, box: Tuple[float, float, float, float], jitter: float = 0.02) -> np.ndarray:
@@ -352,39 +319,25 @@ def assign_targets_nearest(x: np.ndarray, T: np.ndarray, preserve_order: bool = 
     assert M >= N
 
     if preserve_order:
-        # Simple proportional assignment: leftmost N/3 drones -> leftmost targets,
-        # middle N/3 -> middle targets, rightmost N/3 -> rightmost targets
-        # This prevents all left drones from going to H, all right to R/!
         order_x = np.argsort(x[:, 0])
         order_T = np.argsort(T[:, 0])
-        
-        # Divide into 3 roughly equal groups
         n1 = N // 3
         n2 = (N - n1) // 2
         n3 = N - n1 - n2
-        
-        # Divide targets into 3 groups
         m1 = M // 3
         m2 = (M - m1) // 2
         m3 = M - m1 - m2
-        
         assigned = np.zeros((N, 2), dtype=np.float64)
-        
-        # Left group: first n1 drones -> first m1 targets
         for i in range(n1):
             di = order_x[i]
             ti_idx = int(i * m1 / max(n1, 1)) % m1
             ti = order_T[ti_idx]
             assigned[di] = T[ti]
-        
-        # Middle group: middle n2 drones -> middle m2 targets
         for i in range(n2):
             di = order_x[n1 + i]
             ti_idx = m1 + int(i * m2 / max(n2, 1)) % m2
             ti = order_T[ti_idx]
             assigned[di] = T[ti]
-        
-        # Right group: last n3 drones -> last m3 targets
         for i in range(n3):
             di = order_x[n1 + n2 + i]
             ti_idx = m1 + m2 + int(i * m3 / max(n3, 1)) % m3
@@ -392,13 +345,11 @@ def assign_targets_nearest(x: np.ndarray, T: np.ndarray, preserve_order: bool = 
             assigned[di] = T[ti]
         
         return assigned
-    
-    # Original greedy nearest assignment
+
     remaining = set(range(M))
     assigned = np.zeros((N, 2), dtype=np.float64)
 
     for i in range(N):
-        # find nearest among remaining
         idxs = np.array(list(remaining), dtype=np.int64)
         d2 = np.sum((T[idxs] - x[i])**2, axis=1)
         j = idxs[int(np.argmin(d2))]
@@ -406,10 +357,6 @@ def assign_targets_nearest(x: np.ndarray, T: np.ndarray, preserve_order: bool = 
         remaining.remove(int(j))
     return assigned
 
-
-# =========================
-# Swarm dynamics (IVP)
-# =========================
 
 @dataclass
 class SwarmParams:
@@ -432,21 +379,16 @@ def repulsion_forces(x: np.ndarray, krep: float, Rsafe: float) -> np.ndarray:
     """
     Pairwise repulsion for collision-free behavior:
       frep(xi,xj) = krep*(xi-xj)/||xi-xj||^3 if ||xi-xj|| < Rsafe else 0
-    This ensures drones maintain safe distance and prevents collisions.
+    Vectorized over all pairs for speed.
     returns: (N,2)
     """
     N = x.shape[0]
-    F = np.zeros_like(x)
-    for i in range(N):
-        diff = x[i] - x  # (N,2)
-        dist = np.linalg.norm(diff, axis=1) + 1e-12
-        # Repulsion active when within Rsafe distance (collision avoidance zone)
-        mask = (dist < Rsafe) & (dist > 0)
-        if np.any(mask):
-            # Stronger repulsion for closer drones (1/dist^3) ensures collision-free
-            contrib = krep * (diff[mask] / (dist[mask][:, None]**3))
-            F[i] += np.sum(contrib, axis=0)
-    return F
+    diff = x[:, np.newaxis, :] - x[np.newaxis, :, :]
+    dist = np.linalg.norm(diff, axis=2) + 1e-12
+    mask = (dist < Rsafe) & (dist > 1e-10)
+    np.fill_diagonal(mask, False)
+    contrib = np.where(mask[:, :, np.newaxis], krep * diff / (dist[:, :, np.newaxis] ** 3), 0.0)
+    return np.sum(contrib, axis=1)
 
 def accel_position_tracking(x: np.ndarray, v: np.ndarray, T: np.ndarray, p: SwarmParams) -> np.ndarray:
     """
@@ -478,31 +420,32 @@ def rk4_step(x: np.ndarray, v: np.ndarray, dt: float, T: np.ndarray, p: SwarmPar
     return x_next, v_next
 
 def simulate_to_targets(x0: np.ndarray, v0: np.ndarray, T: np.ndarray, p: SwarmParams,
-                        dt: float, steps: int) -> np.ndarray:
+                        dt: float, steps: int, convergence_threshold: float = 0.025,
+                        check_every: int = 50) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    returns trajectory array: (steps+1, N, 2)
+    Returns (traj, x_final, v_final). Stops early if all drones within convergence_threshold of targets.
     """
     x = x0.copy()
     v = v0.copy()
-    traj = np.zeros((steps + 1, x.shape[0], 2), dtype=np.float64)
-    traj[0] = x
+    traj_list = [x.copy()]
     for k in range(steps):
         x, v = rk4_step(x, v, dt, T, p)
-        traj[k+1] = x
+        traj_list.append(x.copy())
+        if (k + 1) % check_every == 0:
+            dists = np.linalg.norm(x - T, axis=1)
+            if np.max(dists) < convergence_threshold and np.mean(dists) < convergence_threshold * 0.6:
+                break
+    traj = np.array(traj_list)
     return traj, x, v
 
-
-# =========================
-# IVP with Velocity Tracking (Sub-problem 3)
-# =========================
 
 @dataclass
 class VTParams:
     m: float = 1.0
     kv: float = 10.0
     kd: float = 3.0
-    krep: float = 0.008  # Repulsion for collision-free behavior during velocity tracking
-    Rsafe: float = 0.04  # Safety distance - drones within this distance repel each other
+    krep: float = 0.008
+    Rsafe: float = 0.04
     vmax: float = 0.9
 
 def accel_velocity_tracking(x: np.ndarray, v: np.ndarray, Vsat_at_x: np.ndarray, p: VTParams) -> np.ndarray:
@@ -531,10 +474,6 @@ def rk4_step_vt(x: np.ndarray, v: np.ndarray, dt: float, Vsat_at_x: np.ndarray, 
     return x_next, v_next
 
 
-# =========================
-# Video object extraction and shape tracking
-# =========================
-
 def extract_object_from_video(video_path: str, max_frames: int = 200, resize_w: int = 320) -> Tuple[list, float]:
     """
     Extract moving object from video using background subtraction.
@@ -545,8 +484,6 @@ def extract_object_from_video(video_path: str, max_frames: int = 200, resize_w: 
         raise FileNotFoundError(f"Cannot open video: {video_path}")
 
     fps = cap.get(cv2.CAP_PROP_FPS)
-    
-    # Read first few frames to build background model
     frames_bg = []
     for _ in range(min(30, max_frames)):
         ret, frame = cap.read()
@@ -561,11 +498,7 @@ def extract_object_from_video(video_path: str, max_frames: int = 200, resize_w: 
     
     if len(frames_bg) == 0:
         raise ValueError("Could not read video frames.")
-    
-    # Compute median background (robust to occasional objects)
     bg_model = np.median(frames_bg, axis=0).astype(np.uint8)
-    
-    # Reset to beginning
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     
     masks = []
@@ -580,21 +513,15 @@ def extract_object_from_video(video_path: str, max_frames: int = 200, resize_w: 
         scale = resize_w / float(w)
         new_h = int(round(h * scale))
         gray = cv2.resize(gray, (resize_w, new_h), interpolation=cv2.INTER_AREA)
-        
-        # Background subtraction
         diff = cv2.absdiff(gray, bg_model)
         _, mask = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
-        
-        # Morphological operations to clean up
         kernel = np.ones((5, 5), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=2)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-        
-        # Remove small noise - keep largest contour
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if contours:
             largest = max(contours, key=cv2.contourArea)
-            if cv2.contourArea(largest) > 100:  # Minimum area threshold
+            if cv2.contourArea(largest) > 100:
                 mask_clean = np.zeros_like(mask)
                 cv2.drawContours(mask_clean, [largest], -1, 255, -1)
                 masks.append(mask_clean)
@@ -619,7 +546,7 @@ def extract_object_shapes_from_masks(masks: list, n_points: int, world_box: Tupl
     """
     shapes = []
     for mask in masks:
-        if np.sum(mask > 0) < 50:  # Too small, use previous shape or empty
+        if np.sum(mask > 0) < 50:
             if len(shapes) > 0:
                 shapes.append(shapes[-1].copy())
             else:
@@ -627,13 +554,10 @@ def extract_object_shapes_from_masks(masks: list, n_points: int, world_box: Tupl
             continue
         
         try:
-            # Sample points from the object mask using contour sampling
             pts01 = sample_points_from_contours(mask, n_points=n_points)
-            # Convert to world coordinates
             T = pts01_to_world(pts01, world_box=world_box)
             shapes.append(T)
         except Exception as e:
-            # Fallback to edge sampling
             try:
                 pts01 = sample_points_from_binary_mask(mask, n_points=n_points, mode="edge")
                 T = pts01_to_world(pts01, world_box=world_box)
@@ -657,41 +581,26 @@ def assign_targets_shape_preserving(x: np.ndarray, T_prev: Optional[np.ndarray],
     assert M >= N
     
     if T_prev is None:
-        # First frame: use nearest assignment
         return assign_targets_nearest(x, T_curr, preserve_order=False)
-    
-    # Strategy: For each drone, find which point in T_prev it was closest to,
-    # then find the corresponding point in T_curr that maintains the same relative position
-    
-    # Compute centroids and normalize shapes
+
     centroid_prev = np.mean(T_prev, axis=0)
     centroid_curr = np.mean(T_curr, axis=0)
-    
-    # Center shapes
     T_prev_centered = T_prev - centroid_prev
     T_curr_centered = T_curr - centroid_curr
-    
-    # Normalize by scale to handle size changes
     scale_prev = np.std(T_prev_centered) + 1e-12
     scale_curr = np.std(T_curr_centered) + 1e-12
     T_prev_norm = T_prev_centered / scale_prev
     T_curr_norm = T_curr_centered / scale_curr
-    
-    # For each drone, find which point in previous shape it was tracking
     drone_to_prev_idx = np.zeros(N, dtype=int)
     for i in range(N):
         dists = np.linalg.norm(T_prev - x[i], axis=1)
         drone_to_prev_idx[i] = int(np.argmin(dists))
-    
-    # Now assign: for each drone, find point in current shape with similar relative position
     assigned = np.zeros((N, 2), dtype=np.float64)
     used_targets = set()
     
     for i in range(N):
         prev_idx = drone_to_prev_idx[i]
         rel_pos_prev = T_prev_norm[prev_idx]
-        
-        # Find best match in current shape
         best_score = -np.inf
         best_j = -1
         
@@ -700,15 +609,10 @@ def assign_targets_shape_preserving(x: np.ndarray, T_prev: Optional[np.ndarray],
                 continue
             
             rel_pos_curr = T_curr_norm[j]
-            
-            # Score based on similarity of relative position
             if np.linalg.norm(rel_pos_prev) > 1e-6 and np.linalg.norm(rel_pos_curr) > 1e-6:
-                # Direction similarity (dot product of normalized vectors)
                 dir_prev = rel_pos_prev / (np.linalg.norm(rel_pos_prev) + 1e-12)
                 dir_curr = rel_pos_curr / (np.linalg.norm(rel_pos_curr) + 1e-12)
                 dir_sim = np.dot(dir_prev, dir_curr)
-                
-                # Distance similarity
                 dist_prev = np.linalg.norm(rel_pos_prev)
                 dist_curr = np.linalg.norm(rel_pos_curr)
                 dist_sim = 1.0 / (1.0 + abs(dist_prev - dist_curr))
@@ -725,7 +629,6 @@ def assign_targets_shape_preserving(x: np.ndarray, T_prev: Optional[np.ndarray],
             assigned[i] = T_curr[best_j]
             used_targets.add(best_j)
         else:
-            # Fallback: use nearest available
             available = [j for j in range(M) if j not in used_targets]
             if available:
                 dists = np.linalg.norm(T_curr[available] - x[i], axis=1)
@@ -737,9 +640,6 @@ def assign_targets_shape_preserving(x: np.ndarray, T_prev: Optional[np.ndarray],
     
     return assigned
 
-# =========================
-# Optical flow -> velocity field
-# =========================
 
 def compute_optical_flow_frames(video_path: str, max_frames: int = 200, resize_w: int = 320) -> Tuple[np.ndarray, float]:
     """
@@ -779,7 +679,7 @@ def compute_optical_flow_frames(video_path: str, max_frames: int = 200, resize_w
             iterations=3, poly_n=7, poly_sigma=1.5, flags=0
         )
         flows.append(flow)
-    flows = np.stack(flows, axis=0)  # (T-1,H,W,2)
+    flows = np.stack(flows, axis=0)
     return flows, fps
 
 def flow_to_world_velocity(flow: np.ndarray, world_box: Tuple[float, float, float, float], dt_video: float) -> np.ndarray:
@@ -789,16 +689,10 @@ def flow_to_world_velocity(flow: np.ndarray, world_box: Tuple[float, float, floa
     """
     xmin, xmax, ymin, ymax = world_box
     H, W, _ = flow.shape
-
-    # pixels to normalized
-    # dx_norm per frame = flow_x / (W-1)
-    # dy_norm per frame = flow_y / (H-1)
     fx = flow[..., 0] / max(1, (W - 1))
     fy = flow[..., 1] / max(1, (H - 1))
-
-    # normalized to world
     vx = fx * (xmax - xmin) / dt_video
-    vy = -fy * (ymax - ymin) / dt_video  # invert y
+    vy = -fy * (ymax - ymin) / dt_video
     V = np.stack([vx, vy], axis=-1)
     return V
 
@@ -808,8 +702,6 @@ def sample_velocity_field_at_positions(V: np.ndarray, x: np.ndarray, world_box: 
     """
     xmin, xmax, ymin, ymax = world_box
     H, W, _ = V.shape
-
-    # map world x,y -> normalized u,v in [0,1]
     u = (x[:, 0] - xmin) / (xmax - xmin + 1e-12)
     v = (ymax - x[:, 1]) / (ymax - ymin + 1e-12)
 
@@ -838,23 +730,21 @@ def sample_velocity_field_at_positions(V: np.ndarray, x: np.ndarray, world_box: 
     return Vxy
 
 
-# =========================
-# Visualization
-# =========================
-
 def animate_trajectory(traj: np.ndarray, world_box: Tuple[float, float, float, float],
-                       out_mp4: str, title: str = "", fps: int = 30, dot_size: int = 12) -> None:
+                       out_mp4: str, title: str = "", fps: int = 30, dot_size: int = 10,
+                       max_frames: int = 350) -> None:
     xmin, xmax, ymin, ymax = world_box
     T, N, _ = traj.shape
-
-    # Calculate actual bounds from trajectory for better framing
+    if T > max_frames:
+        idx = np.linspace(0, T - 1, max_frames, dtype=int)
+        traj = traj[idx]
+        T = traj.shape[0]
     x_tr = traj[:, :, 0].ravel()
     y_tr = traj[:, :, 1].ravel()
     xlo = min(x_tr.min(), xmin)
     xhi = max(x_tr.max(), xmax)
     ylo = min(y_tr.min(), ymin)
     yhi = max(y_tr.max(), ymax)
-    # Add small padding
     pad = 0.1
     xlo -= pad
     xhi += pad
@@ -870,8 +760,6 @@ def animate_trajectory(traj: np.ndarray, world_box: Tuple[float, float, float, f
     if title:
         ax.set_title(title, color="white", fontsize=10)
     ax.axis("off")
-
-    # Simple glow effect for better visibility
     scat = ax.scatter(traj[0, :, 0], traj[0, :, 1], s=dot_size, 
                       c="white", alpha=0.9, edgecolors="none")
 
@@ -894,20 +782,14 @@ def animate_trajectory(traj: np.ndarray, world_box: Tuple[float, float, float, f
     plt.close(fig)
 
 
-# =========================
-# Main pipeline
-# =========================
-
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--word_image", default="inputs/word.png")
+    ap.add_argument("--word_image", default="inputs/handwritten.jpeg")
     ap.add_argument("--text_image", default="inputs/happy_new_year.png", help="Image file for 'Happy New Year' text (required)")
     ap.add_argument("--video", default="inputs/video.mp4")
     ap.add_argument("--outdir", default="outputs")
     ap.add_argument("--N", type=int, default=400, help="Number of particles (higher = clearer formation)")
     ap.add_argument("--seed", type=int, default=7)
-
-    # world / simulation
     ap.add_argument("--dt", type=float, default=0.02)
     ap.add_argument("--steps1", type=int, default=1200, help="Simulation steps for stage1 (more = better convergence)")
     ap.add_argument("--steps2", type=int, default=1500, help="Simulation steps for stage2 (more = better convergence)")
@@ -917,60 +799,34 @@ def main():
 
     set_seed(args.seed)
     ensure_dir(args.outdir)
-
-    # Pick a world box where all shapes fit nicely
     world_box = (-1.2, 1.2, -0.6, 0.6)
-
-    # ---------- Initial state ----------
     x0 = init_positions_grid(args.N, box=world_box, jitter=0.01)
     v0 = np.zeros_like(x0)
-
-    # ---------- Stage 1: handwritten word ----------
     pts01 = load_handwritten_word_points(args.word_image, n_points=args.N)
     T1 = pts01_to_world(pts01, world_box=world_box)
     T1 = assign_targets_nearest(x0, T1)
-
-    # Tuned parameters for better handwritten word formation
-    # Repulsion ensures collision-free behavior: krep and Rsafe prevent drones from getting too close
     p1 = SwarmParams(kp=12.0, kd=5.0, krep=0.008, Rsafe=0.03, vmax=1.0)
     traj1, x1, v1 = simulate_to_targets(x0, v0, T1, p1, dt=args.dt, steps=args.steps1)
     np.save(os.path.join(args.outdir, "traj_stage1.npy"), traj1)
-
-    # ---------- Stage 2: greeting text ----------
-    # Use provided image file for text (required)
     if not os.path.exists(args.text_image):
         raise FileNotFoundError(f"Text image not found: {args.text_image}. Please provide an image file for 'Happy New Year' text.")
     print(f"Using image file for text: {args.text_image}")
     pts01_2 = load_handwritten_word_points(args.text_image, n_points=args.N)
-    
-    # Use full world box for text (no inset needed with proper normalization)
     T2 = pts01_to_world(pts01_2, world_box=world_box)
-    
-    # Use same assignment and similar parameters as Stage 1 (which works well)
     T2 = assign_targets_nearest(x1, T2, preserve_order=False)
-
-    # Use similar parameters to Stage 1 - they work well for word formation
-    # Slightly higher repulsion to handle the more complex multi-word text
-    # Collision-free: repulsion prevents drones from colliding
     p2 = SwarmParams(kp=12.0, kd=5.0, krep=0.010, Rsafe=0.035, vmax=1.0)
     traj2, x2, v2 = simulate_to_targets(x1, v1, T2, p2, dt=args.dt, steps=args.steps2)
     np.save(os.path.join(args.outdir, "traj_stage2.npy"), traj2)
-
-    # ---------- Stage 3: Move to object and track shape from video ----------
     if not os.path.exists(args.video):
         print(f"Warning: Video file not found: {args.video}. Skipping Stage 3.")
-        traj3 = traj2  # Use Stage 2 trajectory as fallback
+        traj3 = traj2
     else:
         try:
             print("Stage 3: Extracting object from video...")
             masks, fps_video = extract_object_from_video(args.video, max_frames=args.max_video_frames, resize_w=320)
             print(f"  Extracted {len(masks)} frames from video (fps: {fps_video:.2f})")
-            
-            # Extract object shapes from each frame
             print("  Extracting object shapes...")
             object_shapes = extract_object_shapes_from_masks(masks, n_points=args.N, world_box=world_box)
-            
-            # Find first valid shape (non-empty)
             first_valid_idx = 0
             for idx, shape in enumerate(object_shapes):
                 if np.any(shape != 0) and np.linalg.norm(shape) > 1e-6:
@@ -981,16 +837,12 @@ def main():
                 raise ValueError("No valid object shapes found in video.")
             
             T_object_initial = object_shapes[first_valid_idx]
-            
-            # Phase 3a: Transition from greeting position to object initial position
             print("  Stage 3a: Transitioning from greeting to object...")
             T_transition = assign_targets_nearest(x2, T_object_initial, preserve_order=False)
             p_transition = SwarmParams(kp=12.0, kd=5.0, krep=0.008, Rsafe=0.03, vmax=1.0)
             traj_transition, x_transition, v_transition = simulate_to_targets(
                 x2, v2, T_transition, p_transition, dt=args.dt, steps=800
             )
-            
-            # Phase 3b: Track object shape through video with shape preservation
             print("  Stage 3b: Tracking object shape through video...")
             dt_video = 1.0 / float(fps_video if fps_video and fps_video > 1 else 25.0)
             p3 = SwarmParams(kp=15.0, kd=6.0, krep=0.008, Rsafe=0.03, vmax=1.2)
@@ -1000,23 +852,14 @@ def main():
             
             traj3_tracking = [x.copy()]
             T_prev = None
-            
-            # Start from first valid frame
             for t in range(first_valid_idx, len(object_shapes)):
                 T_curr = object_shapes[t]
-                
-                # Skip if shape is invalid (empty)
                 if np.all(T_curr == 0) or np.linalg.norm(T_curr) < 1e-6:
                     if T_prev is not None:
-                        T_curr = T_prev  # Use previous shape
+                        T_curr = T_prev
                     else:
                         continue
-                
-                # Assign targets with shape preservation
                 T_assigned = assign_targets_shape_preserving(x, T_prev, T_curr)
-                
-                # Simulate to targets for this frame
-                # Use multiple substeps per video frame for smoother motion
                 substeps = max(1, int(round(dt_video / args.dt)))
                 dt_step = dt_video / substeps
                 
@@ -1025,8 +868,6 @@ def main():
                 
                 traj3_tracking.append(x.copy())
                 T_prev = T_curr.copy()
-            
-            # Combine transition and tracking trajectories
             traj3 = np.vstack([traj_transition, traj3_tracking])
             
         except Exception as e:
@@ -1036,15 +877,12 @@ def main():
             traj3 = traj2
 
     np.save(os.path.join(args.outdir, "traj_stage3.npy"), traj3)
-
-    # ---------- Visualizations ----------
-    # Note: requires ffmpeg installed for mp4 saving
     animate_trajectory(traj1, world_box, os.path.join(args.outdir, "stage1.mp4"),
-                       title="Stage 1: Handwritten formation", fps=30, dot_size=14)
+                       title="Stage 1: Handwritten formation", fps=30, dot_size=10)
     animate_trajectory(traj2, world_box, os.path.join(args.outdir, "stage2.mp4"),
-                       title="Stage 2: Transition to HAPPY NEW YEAR!", fps=30, dot_size=16)
+                       title="Stage 2: Transition to HAPPY NEW YEAR!", fps=30, dot_size=10)
     animate_trajectory(traj3, world_box, os.path.join(args.outdir, "stage3.mp4"),
-                       title="Stage 3: Velocity tracking + repulsion", fps=30, dot_size=14)
+                       title="Stage 3: Velocity tracking + repulsion", fps=30, dot_size=10)
 
     print("DONE.")
     print("Saved trajectories + videos into:", args.outdir)
