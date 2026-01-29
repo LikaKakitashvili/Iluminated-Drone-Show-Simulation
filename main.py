@@ -18,23 +18,21 @@ def set_seed(seed: int) -> None:
     np.random.seed(seed)
 
 def normalize_pts01_tight(pts01: np.ndarray, margin: float = 0.06) -> np.ndarray:
-    """
-    Re-normalize points to [0,1] using their tight bounding box (plus margin).
-    This removes empty image margins so the shape fills the world box better.
-    """
+    
     mins = pts01.min(axis=0)
     maxs = pts01.max(axis=0)
     span = np.maximum(maxs - mins, 1e-9)
     mins = mins - margin * span
     maxs = maxs + margin * span
     span2 = np.maximum(maxs - mins, 1e-9)
-    out = (pts01 - mins) / span2
+    out = (pts01 - mins) / span2 
     return np.clip(out, 0.0, 1.0)
 
 def normalize_pts01_tight_aspect(pts01: np.ndarray, margin: float = 0.08) -> np.ndarray:
     """
-    Tight normalization that PRESERVES aspect ratio (single scale for x/y).
-    This avoids distorting text into "blocky" shapes.
+    Tight normalization that PRESERVES aspect ratio using a single scale (from actual
+    point cloud extent). Output ratio = input ratio; works for any input shape (dynamic).
+    No clipping so points never pile up at 0/1 (avoids edge artifacts).
     """
     mins = pts01.min(axis=0)
     maxs = pts01.max(axis=0)
@@ -45,7 +43,7 @@ def normalize_pts01_tight_aspect(pts01: np.ndarray, margin: float = 0.08) -> np.
     m = float(np.clip(margin, 0.0, 0.49))
     if m > 0:
         out = (out - 0.5) / (1.0 - 2.0 * m) + 0.5
-    return np.clip(out, 0.0, 1.0)
+    return out
 
 
 def farthest_point_sampling(points: np.ndarray, n_samples: int) -> np.ndarray:
@@ -71,11 +69,11 @@ def farthest_point_sampling(points: np.ndarray, n_samples: int) -> np.ndarray:
         selected.append(points[nxt])
     return np.array(selected, dtype=np.float64)
 
-def sample_points_from_contours(mask: np.ndarray, n_points: int, min_contour_area: int = 25) -> np.ndarray:
+def sample_points_from_contours(mask: np.ndarray, n_points: int, min_contour_area: int = 25,
+                                aspect_preserve: bool = True) -> np.ndarray:
     """
-    Sample points uniformly along contour arc-length. This preserves letter structure
-    much better than random edge sampling for handwritten words.
-    Contours with area < min_contour_area are ignored (filters standalone points and speckles).
+    Sample points uniformly along contour arc-length.
+    aspect_preserve=True: single scale (max w,h) for stage 1/2 aspect. False: [0,1]x[0,1] for video (stage 3).
     """
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     if not cnts:
@@ -134,17 +132,19 @@ def sample_points_from_contours(mask: np.ndarray, n_points: int, min_contour_are
         pts = np.vstack([pts, extra])
     
     h, w = mask.shape
-    pts[:, 0] /= (w - 1)
-    pts[:, 1] /= (h - 1)
+    if aspect_preserve:
+        scale = max(w - 1, h - 1, 1)
+        pts[:, 0] /= scale
+        pts[:, 1] /= scale
+    else:
+        pts[:, 0] /= (w - 1)
+        pts[:, 1] /= (h - 1)
     return np.clip(pts, 0.0, 1.0)
 
-def sample_points_from_binary_mask(mask: np.ndarray, n_points: int, mode: str = "edge") -> np.ndarray:
+def sample_points_from_binary_mask(mask: np.ndarray, n_points: int, mode: str = "edge",
+                                   aspect_preserve: bool = True) -> np.ndarray:
     """
-    mask: uint8 {0,255} with foreground=255
-    mode:
-      - "edge": sample points from edges using farthest-point sampling
-      - "fill": sample points from filled region using farthest-point sampling
-    returns: (n_points, 2) points in [0,1]x[0,1] image coordinates (x,y)
+    mask: uint8 {0,255} with foreground=255. aspect_preserve=True for stage 1/2, False for stage 3 video.
     """
     assert mask.ndim == 2
     if mode == "edge":
@@ -172,34 +172,28 @@ def sample_points_from_binary_mask(mask: np.ndarray, n_points: int, mode: str = 
         pts = np.vstack([pts, extra])
 
     h, w = mask.shape
-    pts[:, 0] /= (w - 1)
-    pts[:, 1] /= (h - 1)
+    if aspect_preserve:
+        scale = max(w - 1, h - 1, 1)
+        pts[:, 0] /= scale
+        pts[:, 1] /= scale
+    else:
+        pts[:, 0] /= (w - 1)
+        pts[:, 1] /= (h - 1)
     return np.clip(pts, 0.0, 1.0)
 
-def load_handwritten_word_points(image_path: str, n_points: int) -> np.ndarray:
-    """
-    Loads a handwritten word image, binarizes it, and samples target points.
-    Uses contour-based sampling for better letter structure preservation.
-    For text images, ensures better distribution to prevent edge clustering.
-    """
-    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-    if img is None:
-        raise FileNotFoundError(f"Cannot read image: {image_path}")
-
+def _preprocess_mask_like_load(img: np.ndarray) -> np.ndarray:
+    """Same preprocessing as load_handwritten_word_points (blur, threshold, morphology, CC). Returns mask."""
     img = cv2.GaussianBlur(img, (5, 5), 0)
-
     try:
         mask = cv2.adaptiveThreshold(
             img, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 10
         )
-    except:
+    except Exception:
         _, mask = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
     kernel = np.ones((3, 3), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
     mask = cv2.dilate(mask, kernel, iterations=2)
     mask = cv2.dilate(mask, kernel, iterations=1)
-
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8), connectivity=8)
     if num_labels > 1:
         areas = stats[1:, cv2.CC_STAT_AREA]
@@ -209,6 +203,53 @@ def load_handwritten_word_points(image_path: str, n_points: int) -> np.ndarray:
         for lb in keep_labels:
             mask_out[labels == lb] = 255
         mask = mask_out
+    return mask
+
+
+def export_debug_input_processing(image_path: str, outdir: str, stage_name: str,
+                                  min_contour_area: int = 25) -> None:
+    """
+    Export debug images for stage 1 or 2: mask, edges (Canny), all contours, contours kept.
+    Uses the same preprocessing and contour filter as load_handwritten_word_points / sample_points_from_contours.
+    """
+    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        raise FileNotFoundError(f"Cannot read image: {image_path}")
+    mask = _preprocess_mask_like_load(img)
+
+    prefix = os.path.join(outdir, f"debug_{stage_name}")
+
+    cv2.imwrite(f"{prefix}_mask.png", mask)
+
+    edges = cv2.Canny(mask, 50, 150)
+    cv2.imwrite(f"{prefix}_edges.png", edges)
+
+    cnts_all, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    img_contours_all = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+    cv2.drawContours(img_contours_all, cnts_all, -1, (0, 255, 0), 2)
+    cv2.imwrite(f"{prefix}_contours_all.png", img_contours_all)
+
+    contours_kept = [
+        c for c in cnts_all
+        if c.shape[0] >= 5 and cv2.contourArea(c) >= min_contour_area
+    ]
+    img_contours_kept = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+    cv2.drawContours(img_contours_kept, contours_kept, -1, (0, 255, 0), 2)
+    cv2.imwrite(f"{prefix}_contours_kept.png", img_contours_kept)
+
+    print(f"Debug images: {prefix}_mask.png, _edges.png, _contours_all.png, _contours_kept.png")
+
+
+def load_handwritten_word_points(image_path: str, n_points: int) -> np.ndarray:
+    """
+    Loads a handwritten word image, binarizes it, and samples target points.
+    The output point cloud has the same aspect ratio as the content in the input image;
+    ratio is computed from actual image dimensions and content (works for any input).
+    """
+    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        raise FileNotFoundError(f"Cannot read image: {image_path}")
+    mask = _preprocess_mask_like_load(img)
 
     n_contour = int(n_points * 0.70)
     n_fill = n_points - n_contour
@@ -220,7 +261,7 @@ def load_handwritten_word_points(image_path: str, n_points: int) -> np.ndarray:
 
     pts_fill = sample_points_from_binary_mask(mask, n_points=n_fill, mode="fill")
     pts01 = np.vstack([pts_contour, pts_fill])
-    pts01_norm = normalize_pts01_tight(pts01, margin=0.10)
+    pts01_norm = normalize_pts01_tight_aspect(pts01, margin=0.10)
     return pts01_norm
 
 def render_text_to_points(text: str, n_points: int, img_size=(1400, 400)) -> np.ndarray:
@@ -289,6 +330,43 @@ def render_text_to_points(text: str, n_points: int, img_size=(1400, 400)) -> np.
 
 
 
+def remove_singleton_cluster_points(pts01: np.ndarray, min_cluster_size: int = 5,
+                                     connectivity_radius: float = 0.08) -> np.ndarray:
+    """
+    Remove points that belong to tiny connected components (singleton clusters).
+    Two points are in the same cluster if within connectivity_radius.
+    Keeps only points in components with at least min_cluster_size points.
+    """
+    n = pts01.shape[0]
+    if n <= min_cluster_size:
+        return pts01
+
+    # Union-find to compute connected components by distance
+    parent = np.arange(n, dtype=np.int64)
+
+    def find(i):
+        if parent[i] != i:
+            parent[i] = find(parent[i])
+        return parent[i]
+
+    def unite(i, j):
+        pi, pj = find(i), find(j)
+        if pi != pj:
+            parent[pi] = pj
+
+    r2 = connectivity_radius ** 2
+    for i in range(n):
+        for j in range(i + 1, n):
+            d2 = np.sum((pts01[i] - pts01[j]) ** 2)
+            if d2 <= r2:
+                unite(i, j)
+
+    comp_id = np.array([find(i) for i in range(n)])
+    comp_sizes = np.bincount(comp_id, minlength=n)
+    keep = comp_sizes[comp_id] >= min_cluster_size
+    return pts01[keep]
+
+
 def pts01_to_world(pts01: np.ndarray, world_box: Tuple[float, float, float, float]) -> np.ndarray:
     """
     Map normalized image coords [0,1] to world coords in a box.
@@ -297,6 +375,34 @@ def pts01_to_world(pts01: np.ndarray, world_box: Tuple[float, float, float, floa
     xmin, xmax, ymin, ymax = world_box
     x = xmin + pts01[:, 0] * (xmax - xmin)
     y = ymax - pts01[:, 1] * (ymax - ymin)
+    return np.stack([x, y], axis=1)
+
+
+def pts01_to_world_aspect_preserving(pts01: np.ndarray, world_box: Tuple[float, float, float, float],
+                                     box_inset: float = 0.1) -> np.ndarray:
+    """
+    Map normalized coords to world coords with a single scale L so output aspect ratio
+    equals input aspect ratio (span_x/span_y from actual pts01). Content is centered
+    and scaled to fit inside an inset of the box (box_inset = fraction to leave as
+    margin on each side, e.g. 0.1 = 10%% margin) so points don't pile on the edges.
+    """
+    xmin, xmax, ymin, ymax = world_box
+    cx = float(np.mean(pts01[:, 0]))
+    cy = float(np.mean(pts01[:, 1]))
+    span_x = float(np.ptp(pts01[:, 0]))
+    span_y = float(np.ptp(pts01[:, 1]))
+    span_x = max(span_x, 1e-9)
+    span_y = max(span_y, 1e-9)
+    box_w = xmax - xmin
+    box_h = ymax - ymin
+    inset = max(0.0, min(0.5, box_inset))
+    usable_w = box_w * (1.0 - 2.0 * inset)
+    usable_h = box_h * (1.0 - 2.0 * inset)
+    L = min(usable_w / span_x, usable_h / span_y)
+    x_center = 0.5 * (xmin + xmax)
+    y_center = 0.5 * (ymin + ymax)
+    x = x_center + L * (pts01[:, 0] - cx)
+    y = y_center - L * (pts01[:, 1] - cy)
     return np.stack([x, y], axis=1)
 
 def init_positions_grid(N: int, box: Tuple[float, float, float, float], jitter: float = 0.02) -> np.ndarray:
@@ -364,7 +470,7 @@ class SwarmParams:
     kp: float = 8.0
     kd: float = 4.0
     krep: float = 0.04
-    Rsafe: float = 0.06
+    Rsafe: float = 0
     vmax: float = 0.8
 
 def saturate(v: np.ndarray, vmax: float) -> np.ndarray:
@@ -445,7 +551,7 @@ class VTParams:
     kv: float = 10.0
     kd: float = 3.0
     krep: float = 0.008
-    Rsafe: float = 0.04
+    Rsafe: float = 0
     vmax: float = 0.9
 
 def accel_velocity_tracking(x: np.ndarray, v: np.ndarray, Vsat_at_x: np.ndarray, p: VTParams) -> np.ndarray:
@@ -541,7 +647,9 @@ def extract_object_from_video(video_path: str, max_frames: int = 200, resize_w: 
 
 def extract_object_shapes_from_masks(masks: list, n_points: int, world_box: Tuple[float, float, float, float]) -> list:
     """
-    Extract shape points from each mask frame.
+    Extract shape points from each mask frame (Stage 3). Uses contour-only sampling and
+    original [0,1]x[0,1] normalization + pts01_to_world so Stage 3 is unchanged by the
+    aspect-ratio fixes for stage 1/2.
     Returns list of (N, 2) arrays in world coordinates.
     """
     shapes = []
@@ -552,22 +660,20 @@ def extract_object_shapes_from_masks(masks: list, n_points: int, world_box: Tupl
             else:
                 shapes.append(np.zeros((n_points, 2), dtype=np.float64))
             continue
-        
         try:
-            pts01 = sample_points_from_contours(mask, n_points=n_points)
+            pts01 = sample_points_from_contours(mask, n_points=n_points, aspect_preserve=False)
             T = pts01_to_world(pts01, world_box=world_box)
             shapes.append(T)
-        except Exception as e:
+        except Exception:
             try:
-                pts01 = sample_points_from_binary_mask(mask, n_points=n_points, mode="edge")
+                pts01 = sample_points_from_binary_mask(mask, n_points=n_points, mode="edge", aspect_preserve=False)
                 T = pts01_to_world(pts01, world_box=world_box)
                 shapes.append(T)
-            except:
+            except Exception:
                 if len(shapes) > 0:
                     shapes.append(shapes[-1].copy())
                 else:
                     shapes.append(np.zeros((n_points, 2), dtype=np.float64))
-    
     return shapes
 
 def assign_targets_shape_preserving(x: np.ndarray, T_prev: Optional[np.ndarray], T_curr: np.ndarray) -> np.ndarray:
@@ -730,6 +836,33 @@ def sample_velocity_field_at_positions(V: np.ndarray, x: np.ndarray, world_box: 
     return Vxy
 
 
+def export_debug_targets_image(T: np.ndarray, world_box: Tuple[float, float, float, float],
+                              out_path: str, title: str = "", dot_size: int = 8) -> None:
+    """
+    Save a single image of target points (debug) so you can check if target coordinates
+    are correct before simulation. Same view as the video (black bg, white dots, aspect equal).
+    """
+    xmin, xmax, ymin, ymax = world_box
+    pad = 0.05 * max(xmax - xmin, ymax - ymin)
+    xlo = min(T[:, 0].min(), xmin) - pad
+    xhi = max(T[:, 0].max(), xmax) + pad
+    ylo = min(T[:, 1].min(), ymin) - pad
+    yhi = max(T[:, 1].max(), ymax) + pad
+    fig, ax = plt.subplots(figsize=(8, 5))
+    fig.patch.set_facecolor("black")
+    ax.set_facecolor("black")
+    ax.set_xlim(xlo, xhi)
+    ax.set_ylim(ylo, yhi)
+    ax.set_aspect("equal", adjustable="box")
+    if title:
+        ax.set_title(title, color="white", fontsize=10)
+    ax.axis("off")
+    ax.scatter(T[:, 0], T[:, 1], s=dot_size, c="white", alpha=0.9, edgecolors="none")
+    fig.savefig(out_path, facecolor="black", edgecolor="none", bbox_inches="tight")
+    plt.close(fig)
+    print(f"Debug image: {out_path}")
+
+
 def animate_trajectory(traj: np.ndarray, world_box: Tuple[float, float, float, float],
                        out_mp4: str, title: str = "", fps: int = 30, dot_size: int = 10,
                        max_frames: int = 350) -> None:
@@ -788,33 +921,51 @@ def main():
     ap.add_argument("--text_image", default="inputs/happy_new_year.png", help="Image file for 'Happy New Year' text (required)")
     ap.add_argument("--video", default="inputs/video.mp4")
     ap.add_argument("--outdir", default="outputs")
-    ap.add_argument("--N", type=int, default=400, help="Number of particles (higher = clearer formation)")
+    ap.add_argument("--N", type=int, default=500, help="Number of particles (higher = clearer formation)")
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--dt", type=float, default=0.02)
     ap.add_argument("--steps1", type=int, default=1200, help="Simulation steps for stage1 (more = better convergence)")
     ap.add_argument("--steps2", type=int, default=1500, help="Simulation steps for stage2 (more = better convergence)")
     ap.add_argument("--max_video_frames", type=int, default=220)
+    ap.add_argument("--spacing_scale", type=float, default=0.5,
+                    help="Scale formation and drone spacing (keeps aspect ratio)")
 
     args = ap.parse_args()
 
     set_seed(args.seed)
     ensure_dir(args.outdir)
-    world_box = (-1.2, 1.2, -0.6, 0.6)
-    x0 = init_positions_grid(args.N, box=world_box, jitter=0.01)
-    v0 = np.zeros_like(x0)
+    xmin0, xmax0, ymin0, ymax0 = -1.2, 1.2, -0.6, 0.6
+    world_box = (
+        xmin0 * args.spacing_scale, xmax0 * args.spacing_scale,
+        ymin0 * args.spacing_scale, ymax0 * args.spacing_scale,
+    )
+    print(f"spacing_scale = {args.spacing_scale}  (from --spacing_scale or default)")
+    print(f"world_box = {world_box}")
+    export_debug_input_processing(args.word_image, args.outdir, "stage1", min_contour_area=25)
     pts01 = load_handwritten_word_points(args.word_image, n_points=args.N)
-    T1 = pts01_to_world(pts01, world_box=world_box)
+    pts01 = remove_singleton_cluster_points(pts01, min_cluster_size=5, connectivity_radius=0.08)
+    N_effective = pts01.shape[0]
+    x0 = init_positions_grid(N_effective, box=world_box, jitter=0.01)
+    v0 = np.zeros_like(x0)
+    T1 = pts01_to_world_aspect_preserving(pts01, world_box=world_box)
     T1 = assign_targets_nearest(x0, T1)
-    p1 = SwarmParams(kp=12.0, kd=5.0, krep=0.008, Rsafe=0.03, vmax=1.0)
+    export_debug_targets_image(T1, world_box,
+                               os.path.join(args.outdir, "debug_targets_stage1.png"),
+                               title="Stage 1 target points (handwritten)")
+    p1 = SwarmParams(kp=12.0, kd=5.0, krep=0.008, Rsafe=0, vmax=1.0)
     traj1, x1, v1 = simulate_to_targets(x0, v0, T1, p1, dt=args.dt, steps=args.steps1)
     np.save(os.path.join(args.outdir, "traj_stage1.npy"), traj1)
     if not os.path.exists(args.text_image):
         raise FileNotFoundError(f"Text image not found: {args.text_image}. Please provide an image file for 'Happy New Year' text.")
     print(f"Using image file for text: {args.text_image}")
-    pts01_2 = load_handwritten_word_points(args.text_image, n_points=args.N)
-    T2 = pts01_to_world(pts01_2, world_box=world_box)
+    export_debug_input_processing(args.text_image, args.outdir, "stage2", min_contour_area=25)
+    pts01_2 = load_handwritten_word_points(args.text_image, n_points=N_effective)
+    T2 = pts01_to_world_aspect_preserving(pts01_2, world_box=world_box)
     T2 = assign_targets_nearest(x1, T2, preserve_order=False)
-    p2 = SwarmParams(kp=12.0, kd=5.0, krep=0.010, Rsafe=0.035, vmax=1.0)
+    export_debug_targets_image(T2, world_box,
+                               os.path.join(args.outdir, "debug_targets_stage2.png"),
+                               title="Stage 2 target points (Happy New Year)")
+    p2 = SwarmParams(kp=12.0, kd=5.0, krep=0.010, Rsafe=0, vmax=1.0)
     traj2, x2, v2 = simulate_to_targets(x1, v1, T2, p2, dt=args.dt, steps=args.steps2)
     np.save(os.path.join(args.outdir, "traj_stage2.npy"), traj2)
     if not os.path.exists(args.video):
@@ -826,7 +977,7 @@ def main():
             masks, fps_video = extract_object_from_video(args.video, max_frames=args.max_video_frames, resize_w=320)
             print(f"  Extracted {len(masks)} frames from video (fps: {fps_video:.2f})")
             print("  Extracting object shapes...")
-            object_shapes = extract_object_shapes_from_masks(masks, n_points=args.N, world_box=world_box)
+            object_shapes = extract_object_shapes_from_masks(masks, n_points=N_effective, world_box=world_box)
             first_valid_idx = 0
             for idx, shape in enumerate(object_shapes):
                 if np.any(shape != 0) and np.linalg.norm(shape) > 1e-6:
@@ -839,13 +990,13 @@ def main():
             T_object_initial = object_shapes[first_valid_idx]
             print("  Stage 3a: Transitioning from greeting to object...")
             T_transition = assign_targets_nearest(x2, T_object_initial, preserve_order=False)
-            p_transition = SwarmParams(kp=12.0, kd=5.0, krep=0.008, Rsafe=0.03, vmax=1.0)
+            p_transition = SwarmParams(kp=12.0, kd=5.0, krep=0.008, Rsafe=0, vmax=1.0)
             traj_transition, x_transition, v_transition = simulate_to_targets(
                 x2, v2, T_transition, p_transition, dt=args.dt, steps=800
             )
             print("  Stage 3b: Tracking object shape through video...")
             dt_video = 1.0 / float(fps_video if fps_video and fps_video > 1 else 25.0)
-            p3 = SwarmParams(kp=15.0, kd=6.0, krep=0.008, Rsafe=0.03, vmax=1.2)
+            p3 = SwarmParams(kp=15.0, kd=6.0, krep=0.008, Rsafe=0, vmax=1.2)
             
             x = x_transition.copy()
             v = v_transition.copy()
