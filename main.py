@@ -645,11 +645,71 @@ def extract_object_from_video(video_path: str, max_frames: int = 200, resize_w: 
     
     return masks, fps
 
+def _sample_points_from_mask_stage3(mask: np.ndarray, n_points: int, min_contour_area: int = 25) -> np.ndarray:
+    """
+    Stage-3-only: sample points from mask contours with [0,1]x[0,1] normalization
+    (same as third commit). Not used by stage 1/2.
+    """
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not cnts:
+        raise ValueError("No contours found.")
+    contours = [
+        c.reshape(-1, 2).astype(np.float64)
+        for c in cnts
+        if c.shape[0] >= 5 and cv2.contourArea(c) >= min_contour_area
+    ]
+    if not contours:
+        raise ValueError("No contours with sufficient area.")
+    lengths = []
+    for pts in contours:
+        pts_closed = np.vstack([pts, pts[0]])
+        seg = np.diff(pts_closed, axis=0)
+        L = np.sqrt((seg**2).sum(axis=1)).sum()
+        lengths.append(max(L, 1e-9))
+    lengths = np.array(lengths, dtype=np.float64)
+    total = lengths.sum()
+    alloc = np.maximum(1, np.floor(n_points * (lengths / total)).astype(int))
+    while alloc.sum() < n_points:
+        alloc[np.argmax(lengths)] += 1
+    while alloc.sum() > n_points:
+        i = int(np.argmax(alloc))
+        if alloc[i] > 1:
+            alloc[i] -= 1
+        else:
+            break
+    sampled = []
+    for pts, k in zip(contours, alloc):
+        pts_closed = np.vstack([pts, pts[0]])
+        seg = np.diff(pts_closed, axis=0)
+        seg_len = np.sqrt((seg**2).sum(axis=1))
+        cum = np.concatenate([[0.0], np.cumsum(seg_len)])
+        L = cum[-1]
+        if L <= 0:
+            continue
+        s = np.linspace(0, L, k, endpoint=False)
+        idx = np.searchsorted(cum, s, side="right") - 1
+        idx = np.clip(idx, 0, len(seg_len) - 1)
+        t = (s - cum[idx]) / (seg_len[idx] + 1e-12)
+        p = pts_closed[idx] * (1 - t[:, None]) + pts_closed[idx + 1] * t[:, None]
+        sampled.append(p)
+    pts = np.vstack(sampled)
+    if pts.shape[0] > n_points:
+        pts = pts[np.random.choice(pts.shape[0], size=n_points, replace=False)]
+    elif pts.shape[0] < n_points:
+        needed = n_points - pts.shape[0]
+        extra = pts[np.random.choice(pts.shape[0], size=needed, replace=True)].copy()
+        extra += np.random.normal(scale=0.5, size=extra.shape)
+        pts = np.vstack([pts, extra])
+    h, w = mask.shape
+    pts[:, 0] /= max(w - 1, 1)
+    pts[:, 1] /= max(h - 1, 1)
+    return np.clip(pts, 0.0, 1.0)
+
+
 def extract_object_shapes_from_masks(masks: list, n_points: int, world_box: Tuple[float, float, float, float]) -> list:
     """
-    Extract shape points from each mask frame (Stage 3). Uses contour-only sampling and
-    original [0,1]x[0,1] normalization + pts01_to_world so Stage 3 is unchanged by the
-    aspect-ratio fixes for stage 1/2.
+    Extract shape points from each mask frame (Stage 3 only).
+    Uses Stage-3-only sampling ([0,1]x[0,1]) and pts01_to_world. Unchanged by stage 1/2 logic.
     Returns list of (N, 2) arrays in world coordinates.
     """
     shapes = []
@@ -661,7 +721,7 @@ def extract_object_shapes_from_masks(masks: list, n_points: int, world_box: Tupl
                 shapes.append(np.zeros((n_points, 2), dtype=np.float64))
             continue
         try:
-            pts01 = sample_points_from_contours(mask, n_points=n_points, aspect_preserve=False)
+            pts01 = _sample_points_from_mask_stage3(mask, n_points=n_points)
             T = pts01_to_world(pts01, world_box=world_box)
             shapes.append(T)
         except Exception:
@@ -915,6 +975,32 @@ def animate_trajectory(traj: np.ndarray, world_box: Tuple[float, float, float, f
     plt.close(fig)
 
 
+def transform_points_between_boxes(pts: np.ndarray, from_box: Tuple[float, float, float, float],
+                                   to_box: Tuple[float, float, float, float]) -> np.ndarray:
+    """Transform (N,2) points from from_box to to_box (linear map)."""
+    xmin_f, xmax_f, ymin_f, ymax_f = from_box
+    xmin_t, xmax_t, ymin_t, ymax_t = to_box
+    u = (pts[:, 0] - xmin_f) / max(xmax_f - xmin_f, 1e-12)
+    v = (pts[:, 1] - ymin_f) / max(ymax_f - ymin_f, 1e-12)
+    out = np.empty_like(pts)
+    out[:, 0] = xmin_t + u * (xmax_t - xmin_t)
+    out[:, 1] = ymin_t + v * (ymax_t - ymin_t)
+    return out
+
+
+def transform_velocities_between_boxes(v: np.ndarray, from_box: Tuple[float, float, float, float],
+                                       to_box: Tuple[float, float, float, float]) -> np.ndarray:
+    """Scale (N,2) velocities when transforming between boxes (scale by box size ratio)."""
+    xmin_f, xmax_f, ymin_f, ymax_f = from_box
+    xmin_t, xmax_t, ymin_t, ymax_t = to_box
+    sx = (xmax_t - xmin_t) / max(xmax_f - xmin_f, 1e-12)
+    sy = (ymax_t - ymin_t) / max(ymax_f - ymin_f, 1e-12)
+    out = v.copy()
+    out[:, 0] *= sx
+    out[:, 1] *= sy
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--word_image", default="inputs/handwritten.jpeg")
@@ -926,7 +1012,10 @@ def main():
     ap.add_argument("--dt", type=float, default=0.02)
     ap.add_argument("--steps1", type=int, default=1200, help="Simulation steps for stage1 (more = better convergence)")
     ap.add_argument("--steps2", type=int, default=1500, help="Simulation steps for stage2 (more = better convergence)")
-    ap.add_argument("--max_video_frames", type=int, default=220)
+    ap.add_argument("--max_video_frames", type=int, default=None,
+                    help="Max frames for Stage 3 (overrides --video_duration_seconds if set)")
+    ap.add_argument("--video_duration_seconds", type=float, default=10.0,
+                    help="Use this many seconds from video for Stage 3 (~10 sec default)")
     ap.add_argument("--spacing_scale", type=float, default=0.5,
                     help="Scale formation and drone spacing (keeps aspect ratio)")
 
@@ -973,11 +1062,23 @@ def main():
         traj3 = traj2
     else:
         try:
+            world_box_stage3 = (-1.2, 1.2, -0.6, 0.6)
+            x2_s3 = transform_points_between_boxes(x2, world_box, world_box_stage3)
+            v2_s3 = transform_velocities_between_boxes(v2, world_box, world_box_stage3)
             print("Stage 3: Extracting object from video...")
-            masks, fps_video = extract_object_from_video(args.video, max_frames=args.max_video_frames, resize_w=320)
-            print(f"  Extracted {len(masks)} frames from video (fps: {fps_video:.2f})")
+            if args.max_video_frames is not None:
+                max_frames_stage3 = args.max_video_frames
+            else:
+                cap_fps = cv2.VideoCapture(args.video)
+                fps_for_duration = cap_fps.get(cv2.CAP_PROP_FPS) if cap_fps.isOpened() else 30.0
+                cap_fps.release()
+                if fps_for_duration <= 0:
+                    fps_for_duration = 30.0
+                max_frames_stage3 = int(fps_for_duration * args.video_duration_seconds)
+            masks, fps_video = extract_object_from_video(args.video, max_frames=max_frames_stage3, resize_w=320)
+            print(f"  Extracted {len(masks)} frames from video (~{args.video_duration_seconds}s, fps: {fps_video:.2f})")
             print("  Extracting object shapes...")
-            object_shapes = extract_object_shapes_from_masks(masks, n_points=N_effective, world_box=world_box)
+            object_shapes = extract_object_shapes_from_masks(masks, n_points=N_effective, world_box=world_box_stage3)
             first_valid_idx = 0
             for idx, shape in enumerate(object_shapes):
                 if np.any(shape != 0) and np.linalg.norm(shape) > 1e-6:
@@ -989,14 +1090,14 @@ def main():
             
             T_object_initial = object_shapes[first_valid_idx]
             print("  Stage 3a: Transitioning from greeting to object...")
-            T_transition = assign_targets_nearest(x2, T_object_initial, preserve_order=False)
-            p_transition = SwarmParams(kp=12.0, kd=5.0, krep=0.008, Rsafe=0, vmax=1.0)
+            T_transition = assign_targets_nearest(x2_s3, T_object_initial, preserve_order=False)
+            p_transition = SwarmParams(kp=12.0, kd=5.0, krep=0.008, Rsafe=0.03, vmax=1.0)
             traj_transition, x_transition, v_transition = simulate_to_targets(
-                x2, v2, T_transition, p_transition, dt=args.dt, steps=800
+                x2_s3, v2_s3, T_transition, p_transition, dt=args.dt, steps=800
             )
             print("  Stage 3b: Tracking object shape through video...")
             dt_video = 1.0 / float(fps_video if fps_video and fps_video > 1 else 25.0)
-            p3 = SwarmParams(kp=15.0, kd=6.0, krep=0.008, Rsafe=0, vmax=1.2)
+            p3 = SwarmParams(kp=15.0, kd=6.0, krep=0.008, Rsafe=0.03, vmax=1.2)
             
             x = x_transition.copy()
             v = v_transition.copy()
@@ -1019,7 +1120,10 @@ def main():
                 
                 traj3_tracking.append(x.copy())
                 T_prev = T_curr.copy()
-            traj3 = np.vstack([traj_transition, traj3_tracking])
+            traj3_s3 = np.vstack([traj_transition, traj3_tracking])
+            traj3 = transform_points_between_boxes(
+                traj3_s3.reshape(-1, 2), world_box_stage3, world_box
+            ).reshape(traj3_s3.shape)
             
         except Exception as e:
             import traceback
